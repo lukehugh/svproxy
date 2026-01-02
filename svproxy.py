@@ -1,9 +1,29 @@
+import argparse
+import logging
 import socket
 import selectors
 import re
 
+logger = logging.getLogger(__name__)
 
 HELLO_MSG = b'SEGGER SystemView V3.32.00\x00\x00\x00\x00\x00\x00'
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog='svproxy',
+        description='Bridge non-J-Link probes with SystemView.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('--bind', type=str, default='localhost', help='bind address')
+    parser.add_argument('--port', type=int, default=19111, help='port number')
+    parser.add_argument('--openocd', type=str, default='localhost', help='OpenOCD address')
+    parser.add_argument('--tcl-port', type=int, default=6666, help='OpenOCD Tcl RPC port')
+    return parser.parse_args()
+
+
+def format_sock_name(addr):
+    return f'{addr[0]}:{addr[1]}'
 
 
 def tcl_rpc(sock, cmd):
@@ -18,38 +38,65 @@ def tcl_rpc(sock, cmd):
     return buff.decode('ascii')
 
 
-def start_rtt(tcl_sock):
-    tcl_rpc(tcl_sock, 'init')
+def start_rtt(openocd, tcl_port):
+    logger.info(f'Connecting OpenOCD Tcl RPC server.')
+    tcl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    tcl_rpc(tcl_sock, 'mww 0xe000edfc 0x01000000')
-    tcl_rpc(tcl_sock, 'mww 0xe0001000 1')
+    try:
+        tcl_sock.connect((openocd, tcl_port))
+    except ConnectionRefusedError:
+        tcl_sock.close()
+        logger.error('Cannot connect to OpenOCD: Connection refused.')
+        return None
 
-    tcl_rpc(tcl_sock, 'rtt setup 0x20000000 0xC000 "SEGGER RTT"')
-    tcl_rpc(tcl_sock, 'rtt polling_interval 1')
-    tcl_rpc(tcl_sock, 'rtt start')
+    tcl_sock.settimeout(1.0)
+    tcl_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    logger.info('OpenOCD Tcl RPC server Connected.')
 
-    channel = int(re.search(r'(\d+):\sSysView', tcl_rpc(tcl_sock, 'rtt channels'))[1])
-    rtt_port = 9000 + channel
-    tcl_rpc(tcl_sock, f'rtt server start {rtt_port} {channel}')
+    try:
+        logger.info('Initialize target.')
+        tcl_rpc(tcl_sock, 'init')
 
-    rtt_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    rtt_sock.connect(('localhost', rtt_port))
-    rtt_sock.setblocking(False)
-    rtt_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        logger.info('Enable DWT Counter on target.')
+        tcl_rpc(tcl_sock, 'mww 0xe000edfc 0x01000000')
+        tcl_rpc(tcl_sock, 'mww 0xe0001000 1')
+
+        logger.info('Setup RTT.')
+        tcl_rpc(tcl_sock, 'rtt setup 0x20000000 0xC000 "SEGGER RTT"')
+        tcl_rpc(tcl_sock, 'rtt polling_interval 1')
+        tcl_rpc(tcl_sock, 'rtt start')
+
+        logger.info('Search for SystemView RTT channel.')
+        match = re.search(r'(\d+):\sSysView', tcl_rpc(tcl_sock, 'rtt channels'))
+        if not match:
+            logger.error('Could not find SystemView RTT channel.')
+            tcl_sock.close()
+            return None
+        channel = int(match[1])
+        logger.info(f'Found SystemView RTT channel: {channel}')
+
+        rtt_port = 9000 + channel
+        logger.info(f'Start RTT channel on {openocd}:{rtt_port}.')
+        tcl_rpc(tcl_sock, f'rtt server start {rtt_port} {channel}')
+
+        logger.info('Connecting to RTT server.')
+        rtt_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        rtt_sock.connect((openocd, rtt_port))
+        rtt_sock.setblocking(False)
+        rtt_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        logger.info('RTT Connected.')
+    finally:
+        tcl_sock.close()
+
     return rtt_sock
 
 
 def main():
-    tcl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcl_sock.connect(('localhost', 6666))
-    tcl_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    args = parse_args()
 
-    rtt_sock = start_rtt(tcl_sock)
-
-    listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listen_sock.bind(('localhost', 19111))
-    listen_sock.listen()
-    listen_sock.setblocking(False)
+    rtt_sock = start_rtt(args.openocd, args.tcl_port)
+    if not rtt_sock:
+        return
 
     conn_socks = {}
     outgoing = {rtt_sock: bytearray()}
@@ -58,6 +105,7 @@ def main():
     sel = selectors.DefaultSelector()
 
     def close_conn(conn):
+        logger.info(f'Disconnect from {format_sock_name(conn.getpeername())}.')
         del conn_socks[conn]
         del outgoing[conn]
         sel.unregister(conn)
@@ -65,18 +113,21 @@ def main():
 
     def accept(sock, mask):
         conn, addr = sock.accept()
+        logger.info(f'Accepted connection from {format_sock_name(conn.getpeername())}.')
         conn.setblocking(False)
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         conn_socks[conn] = -1
         outgoing[conn] = bytearray()
-        sel.register(conn, selectors.EVENT_READ, hand_shake)
+        sel.register(conn, selectors.EVENT_READ, handshake)
+        logger.info(f'Waiting for handshake request from {format_sock_name(conn.getpeername())}.')
 
-    def hand_shake(conn, mask):
+    def handshake(conn, mask):
         read_num = -conn_socks[conn] - 1
         data = conn.recv(len(HELLO_MSG) - read_num)
         if data:
             read_num += len(data)
             if read_num == len(HELLO_MSG):
+                logger.info(f'Handshake with {format_sock_name(conn.getpeername())} successful.')
                 conn_socks[conn] = 0
                 outgoing[conn] = bytearray(HELLO_MSG)
                 sel.unregister(conn)
@@ -100,6 +151,7 @@ def main():
                         send_num = conn.send(data)
                         outgoing[conn].extend(data[send_num:])
             else:
+                logger.error('Cannot read from OpenOCD RTT port.')
                 running = False
         if mask & selectors.EVENT_WRITE:
             if outgoing[sock]:
@@ -136,8 +188,15 @@ def main():
                 outgoing[conn] = outgoing[conn][send_num:]
 
     def serve_forever():
-        sel.register(listen_sock, selectors.EVENT_READ, accept)
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.bind((args.bind, args.port))
+        server_sock.listen()
+        server_sock.setblocking(False)
+        logger.info(f'Listening on {format_sock_name(server_sock.getsockname())}.')
+
+        sel.register(server_sock, selectors.EVENT_READ, accept)
         sel.register(rtt_sock, selectors.EVENT_READ | selectors.EVENT_WRITE, handle_rtt)
+
         try:
             while running:
                 events = sel.select()
@@ -147,11 +206,10 @@ def main():
         finally:
             for sock in conn_socks:
                 close_conn(sock)
-            sel.unregister(listen_sock)
+            sel.unregister(server_sock)
             sel.unregister(rtt_sock)
-            listen_sock.close()
+            server_sock.close()
             rtt_sock.close()
-            tcl_sock.close()
 
     try:
         serve_forever()
@@ -160,4 +218,8 @@ def main():
 
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(levelname)s] %(message)s'
+    )
     main()
