@@ -1,7 +1,6 @@
 import argparse
 import logging
-import socket
-import selectors
+import asyncio
 import re
 
 logger = logging.getLogger(__name__)
@@ -9,217 +8,150 @@ logger = logging.getLogger(__name__)
 HELLO_MSG = b'SEGGER SystemView V3.32.00\x00\x00\x00\x00\x00\x00'
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog='svproxy',
         description='Bridge non-J-Link probes with SystemView.',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('--bind', type=str, default='localhost', help='bind address')
+    parser.add_argument('--bind', type=str, default='127.0.0.1', help='bind address')
     parser.add_argument('--port', type=int, default=19111, help='port number')
-    parser.add_argument('--openocd', type=str, default='localhost', help='OpenOCD address')
+    parser.add_argument('--openocd', type=str, default='127.0.0.1', help='OpenOCD address')
     parser.add_argument('--tcl-port', type=int, default=6666, help='OpenOCD Tcl RPC port')
+    parser.add_argument('--search-addr', type=lambda x: int(x, 0), default='0x20000000', help='RTT search address')
+    parser.add_argument('--search-size', type=lambda x: int(x, 0), default='0xFFFFFFFF', help='RTT search range')
     return parser.parse_args()
 
 
-def format_sock_name(addr):
-    return f'{addr[0]}:{addr[1]}'
+class TclRPC:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.reader = reader
+        self.writer = writer
+
+    async def __call__(self, cmd: str) -> str:
+        self.writer.write(cmd.encode('ascii') + b'\x1a')
+        await self.writer.drain()
+        data = await self.reader.readuntil(b'\x1a')
+        return data.strip(b'\x1a').decode('ascii')
 
 
-def tcl_rpc(sock, cmd):
-    sock.sendall(cmd.encode('ascii') + b'\x1a')
-    buff = bytearray()
-    while True:
-        chunk = sock.recv(4096)
-        if chunk.endswith(b'\x1a'):
-            buff.extend(chunk[:-1])
-            break
-        buff.extend(chunk)
-    return buff.decode('ascii')
+class SystemViewProxy:
+    def __init__(self, openocd: str, tcl_port: int, search_addr: int, search_size: int) -> None:
+        self.openocd = openocd
+        self.tcl_port = tcl_port
+        self.search_addr = search_addr
+        self.search_size = search_size
 
+    async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        client_info = ':'.join(map(str, writer.get_extra_info("peername")))
+        logger.info(f'Accepted connection from {client_info}.')
 
-def start_rtt(openocd, tcl_port):
-    logger.info(f'Connecting OpenOCD Tcl RPC server.')
-    tcl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        logger.info(f'Waiting for handshake request from {client_info}.')
+        await reader.readexactly(len(HELLO_MSG))
+        logger.info(f'Handshake with {client_info} successful.')
+        writer.write(HELLO_MSG)
+        await writer.drain()
 
-    try:
-        tcl_sock.connect((openocd, tcl_port))
-    except ConnectionRefusedError:
-        tcl_sock.close()
-        logger.error('Cannot connect to OpenOCD: Connection refused.')
-        return None
+        logger.info('Connecting OpenOCD Tcl RPC server.')
+        try:
+            tcl_reader, tcl_writer = await asyncio.open_connection(self.openocd, self.tcl_port)
+        except ConnectionRefusedError:
+            logger.error('Cannot connect to OpenOCD: Connection refused.')
+            writer.close()
+            await writer.wait_closed()
+            return
 
-    tcl_sock.settimeout(1.0)
-    tcl_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    logger.info('OpenOCD Tcl RPC server Connected.')
+        logger.info('OpenOCD Tcl RPC server connected.')
 
-    try:
-        logger.info('Initialize target.')
-        tcl_rpc(tcl_sock, 'init')
-
-        logger.info('Enable DWT Counter on target.')
-        tcl_rpc(tcl_sock, 'mww 0xe000edfc 0x01000000')
-        tcl_rpc(tcl_sock, 'mww 0xe0001000 1')
+        tcl_rpc = TclRPC(tcl_reader, tcl_writer)
 
         logger.info('Setup RTT.')
-        tcl_rpc(tcl_sock, 'rtt setup 0x20000000 0xC000 "SEGGER RTT"')
-        tcl_rpc(tcl_sock, 'rtt polling_interval 1')
-        tcl_rpc(tcl_sock, 'rtt start')
+        await tcl_rpc('init')
+        await tcl_rpc(f'rtt setup 0x{self.search_addr:08X} 0x{self.search_size:08X} "SEGGER RTT"')
+        await tcl_rpc('rtt polling_interval 1')
+        await tcl_rpc('rtt start')
 
         logger.info('Search for SystemView RTT channel.')
-        match = re.search(r'(\d+):\sSysView', tcl_rpc(tcl_sock, 'rtt channels'))
+        match = re.search(r'(\d+):\sSysView', await tcl_rpc('rtt channels'))
+
         if not match:
             logger.error('Could not find SystemView RTT channel.')
-            tcl_sock.close()
-            return None
+            tcl_writer.close()
+            writer.close()
+            await asyncio.gather(tcl_writer.wait_closed(), writer.wait_closed())
+            return
+
         channel = int(match[1])
         logger.info(f'Found SystemView RTT channel: {channel}')
 
         rtt_port = 9000 + channel
-        logger.info(f'Start RTT channel on {openocd}:{rtt_port}.')
-        tcl_rpc(tcl_sock, f'rtt server start {rtt_port} {channel}')
+        logger.info(f'Start RTT server on port {rtt_port}.')
+        await tcl_rpc(f'rtt server start {rtt_port} {channel}')
 
         logger.info('Connecting to RTT server.')
-        rtt_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        rtt_sock.connect((openocd, rtt_port))
-        rtt_sock.setblocking(False)
-        rtt_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        logger.info('RTT Connected.')
-    finally:
-        tcl_sock.close()
+        rtt_reader, rtt_writer = await asyncio.open_connection(self.openocd, rtt_port)
+        logger.info('RTT server connected.')
 
-    return rtt_sock
+        logger.info('Detect target CPU type.')
+        cpu_type = await tcl_rpc('[target current] cget -type')
+        logger.info(f'Target CPU type: {cpu_type}.')
+        if cpu_type == 'cortex_m':
+            logger.info('Enable DWT counter.')
+            await tcl_rpc('mww 0xe000edfc 0x01000000')
+            await tcl_rpc('mww 0xe0001000 1')
 
+        async def rtt_to_system_view() -> None:
+            while True:
+                data = await rtt_reader.read(4096)
+                if not data:
+                    logger.error('Cannot read from RTT server.')
+                    break
+                writer.write(data)
+                await writer.drain()
 
-def main():
-    args = parse_args()
+        async def system_view_to_rtt() -> None:
+            while True:
+                try:
+                    num_bytes = await reader.readexactly(1)
+                    data = await reader.readexactly(num_bytes[0])
+                    rtt_writer.write(data)
+                    await rtt_writer.drain()
+                except asyncio.IncompleteReadError:
+                    logger.error('Cannot read from SystemView.')
+                    break
 
-    rtt_sock = start_rtt(args.openocd, args.tcl_port)
-    if not rtt_sock:
-        return
+        tasks = (
+            asyncio.create_task(rtt_to_system_view()),
+            asyncio.create_task(system_view_to_rtt()),
+        )
 
-    conn_socks = {}
-    outgoing = {rtt_sock: bytearray()}
-    running = True
-
-    sel = selectors.DefaultSelector()
-
-    def close_conn(conn):
-        logger.info(f'Disconnect from {format_sock_name(conn.getpeername())}.')
-        del conn_socks[conn]
-        del outgoing[conn]
-        sel.unregister(conn)
-        conn.close()
-
-    def accept(sock, mask):
-        conn, addr = sock.accept()
-        logger.info(f'Accepted connection from {format_sock_name(conn.getpeername())}.')
-        conn.setblocking(False)
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        conn_socks[conn] = -1
-        outgoing[conn] = bytearray()
-        sel.register(conn, selectors.EVENT_READ, handshake)
-        logger.info(f'Waiting for handshake request from {format_sock_name(conn.getpeername())}.')
-
-    def handshake(conn, mask):
-        read_num = -conn_socks[conn] - 1
-        data = conn.recv(len(HELLO_MSG) - read_num)
-        if data:
-            read_num += len(data)
-            if read_num == len(HELLO_MSG):
-                logger.info(f'Handshake with {format_sock_name(conn.getpeername())} successful.')
-                conn_socks[conn] = 0
-                outgoing[conn] = bytearray(HELLO_MSG)
-                sel.unregister(conn)
-                sel.register(conn, selectors.EVENT_READ | selectors.EVENT_WRITE, handle_conn)
-            else:
-                conn_socks[conn] = -read_num - 1
-        else:
-            close_conn(conn)
-
-    def handle_rtt(sock, mask):
-        nonlocal outgoing, running
-        if mask & selectors.EVENT_READ:
-            data = sock.recv(4096)
-            if data:
-                for conn in conn_socks:
-                    if conn_socks[conn] < 0:
-                        continue
-                    if outgoing[conn]:
-                        outgoing[conn].extend(data)
-                    else:
-                        send_num = conn.send(data)
-                        outgoing[conn].extend(data[send_num:])
-            else:
-                logger.error('Cannot read from OpenOCD RTT port.')
-                running = False
-        if mask & selectors.EVENT_WRITE:
-            if outgoing[sock]:
-                send_num = sock.send(outgoing[sock])
-                outgoing[sock] = outgoing[sock][send_num:]
-
-    def handle_conn(conn, mask):
-        nonlocal outgoing
-        if mask & selectors.EVENT_READ:
-            data = conn.recv(4096)
-            if data:
-                num_bytes = conn_socks[conn]
-                read_ptr = 0
-                while read_ptr < len(data):
-                    if num_bytes == 0:
-                        num_bytes = data[read_ptr]
-                        read_ptr += 1
-                    else:
-                        read_num = min(num_bytes, len(data) - read_ptr)
-                        if outgoing[rtt_sock]:
-                            outgoing[rtt_sock].extend(data[read_ptr:read_ptr + read_num])
-                        else:
-                            send_num = rtt_sock.send(data[read_ptr:read_ptr + read_num])
-                            outgoing[rtt_sock].extend(data[read_ptr + send_num:read_ptr + read_num])
-                        num_bytes -= read_num
-                        read_ptr += read_num
-                conn_socks[conn] = num_bytes
-            else:
-                close_conn(conn)
-                return
-        if mask & selectors.EVENT_WRITE:
-            if outgoing[conn]:
-                send_num = conn.send(outgoing[conn])
-                outgoing[conn] = outgoing[conn][send_num:]
-
-    def serve_forever():
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.bind((args.bind, args.port))
-        server_sock.listen()
-        server_sock.setblocking(False)
-        logger.info(f'Listening on {format_sock_name(server_sock.getsockname())}.')
-
-        sel.register(server_sock, selectors.EVENT_READ, accept)
-        sel.register(rtt_sock, selectors.EVENT_READ | selectors.EVENT_WRITE, handle_rtt)
+        logger.info(f'Relaying packets between RTT server and SystemView.')
 
         try:
-            while running:
-                events = sel.select()
-                for key, mask in events:
-                    callback = key.data
-                    callback(key.fileobj, mask)
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         finally:
-            for sock in conn_socks:
-                close_conn(sock)
-            sel.unregister(server_sock)
-            sel.unregister(rtt_sock)
-            server_sock.close()
-            rtt_sock.close()
+            rtt_writer.close()
+            tcl_writer.close()
+            writer.close()
+            await asyncio.gather(rtt_writer.wait_closed(), tcl_writer.wait_closed(), writer.wait_closed())
 
-    try:
-        serve_forever()
-    except KeyboardInterrupt:
-        pass
+        logger.info(f'Disconnected from {client_info}')
+
+
+async def main(args: argparse.Namespace) -> None:
+    proxy = SystemViewProxy(args.openocd, args.tcl_port, args.search_addr, args.search_size)
+    server = await asyncio.start_server(proxy.handle_connection, args.bind, args.port)
+    logger.info(f'Listening on {args.bind}:{args.port}.')
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == '__main__':
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[%(levelname)s] %(message)s'
-    )
-    main()
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    try:
+        asyncio.run(main(parse_args()))
+    except KeyboardInterrupt:
+        pass
